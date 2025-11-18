@@ -12,6 +12,7 @@ import org.keycloak.connections.jpa.JpaConnectionProvider;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.RoleMapperModel;
+import org.keycloak.models.utils.MultivaluedHashMap;
 import java.util.regex.Pattern;
 import java.util.List;
 import java.util.ArrayList;
@@ -165,7 +166,7 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
         return filteredGroups.stream();
     }
 
-    private org.keycloak.models.utils.MultivaluedHashMap<String, String> getModel() {
+    private MultivaluedHashMap<String, String> getModel() {
         var component = this.session.getContext().getRealm().getComponent(this.componentId);
         if (component != null) {
             return component.getConfig();
