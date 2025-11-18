@@ -179,3 +179,5 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
             group.getSubGroupsStream().forEach(sub -> addGroupRecursively(groups, sub));
         }
     }
+
+}
