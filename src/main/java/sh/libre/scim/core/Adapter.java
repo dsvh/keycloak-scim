@@ -15,6 +15,8 @@ import org.keycloak.models.RoleMapperModel;
 import org.keycloak.common.util.MultivaluedHashMap;
 import sh.libre.scim.jpa.ScimResource;
 import de.captaingoldfish.scim.sdk.common.resources.ResourceNode;
+import de.captaingoldfish.scim.sdk.client.ScimRequestBuilder;
+import de.captaingoldfish.scim.sdk.client.builder.PatchBuilder;
 import java.util.regex.Pattern;
 import java.util.List;
 import java.util.ArrayList;
@@ -182,6 +184,14 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
         if (groups.add(group)) {
             group.getSubGroupsStream().forEach(sub -> addGroupRecursively(groups, sub));
         }
+    }
+
+    private MultivaluedHashMap<String, String> getModel() {
+        var component = this.session.getContext().getRealm().getComponent(this.componentId);
+        if (component != null) {
+            return component.getConfig();
+        }
+        return null;
     }
 
 }

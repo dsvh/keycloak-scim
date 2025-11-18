@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import jakarta.persistence.NoResultException;
 
 import de.captaingoldfish.scim.sdk.client.ScimRequestBuilder;
