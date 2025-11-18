@@ -165,6 +165,14 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
         return filteredGroups.stream();
     }
 
+    private org.keycloak.models.utils.MultivaluedHashMap<String, String> getModel() {
+        var component = this.session.getContext().getRealm().getComponent(this.componentId);
+        if (component != null) {
+            return component.getConfig();
+        }
+        return null;
+    }
+
     private void addGroupRecursively(Set<org.keycloak.models.GroupModel> groups, org.keycloak.models.GroupModel group) {
         if (groups.add(group)) {
             group.getSubGroupsStream().forEach(sub -> addGroupRecursively(groups, sub));
