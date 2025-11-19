@@ -183,6 +183,32 @@ public class ScimClient {
                             .sendRequest();
                     }
                 } catch (ResponseException e) {
+                    // If PUT is not supported (405) or resource doesn't exist (404), try PATCH or create
+                    if (e.getStatus() == 404 || e.getStatus() == 405) {
+                        if (e.getStatus() == 405 && adapter.getType().equals("Group")) {
+                            // Try PATCH for groups if PUT is not supported
+                            LOGGER.infof("PUT not supported for groups, trying PATCH for %s", adapter.getId());
+                            return adapter.toPatchBuilder(scimRequestBuilder, url)
+                                          .sendRequest();
+                        } else if (e.getStatus() == 404) {
+                            // Resource doesn't exist, create it
+                            LOGGER.infof("Resource %s not found at %s, creating instead", adapter.getId(), url);
+                            ServerResponse<S> createResponse = scimRequestBuilder
+                                .create(adapter.getResourceClass(), ("/" + adapter.getSCIMEndpoint()).formatted())
+                                .setResource(adapter.toSCIM(false))
+                                .sendRequest();
+                            // Update the existing mapping with the new externalId
+                            adapter.apply(createResponse.getResource());
+                            var existingMapping = adapter.getMapping();
+                            if (existingMapping != null) {
+                                existingMapping.setExternalId(adapter.getExternalId());
+                                getEM().merge(existingMapping);
+                            } else {
+                                adapter.saveMapping();
+                            }
+                            return createResponse;
+                        }
+                    }
                     throw new RuntimeException(e);
                 }
             });
