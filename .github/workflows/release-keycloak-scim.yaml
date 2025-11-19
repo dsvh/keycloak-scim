@@ -27,15 +27,18 @@ jobs:
         with:
           gradle-version: 8.10.2
 
+      - name: Get version
+        run: echo "VERSION=$(./gradlew properties --property version --quiet | tail -1 | cut -d'=' -f2)" >> $GITHUB_ENV
+
       - name: Build with Gradle
-        run: gradle shadowJar
+        run: ./gradlew shadowJar
 
       - name: Create Release with jar file
         uses: "marvinpinto/action-automatic-releases@latest"
         with:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
-          automatic_release_tag: "latest"
+          automatic_release_tag: "v${{ env.VERSION }}"
           prerelease: false
-          title: "keycloak-scim release"
+          title: "keycloak-scim ${{ env.VERSION }} release"
           files: |
             ./build/libs/*.jar
