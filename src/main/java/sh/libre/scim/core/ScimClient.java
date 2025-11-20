@@ -152,7 +152,9 @@ public class ScimClient {
             if (statusCode == 409) {
                 // Check if we should map to existing
                 boolean shouldMap = false;
-                if (adapter instanceof UserAdapter && "true".equals(this.model.get("map-existing-users"))) {
+                String mapUsersConfig = this.model.get("map-existing-users");
+                LOGGER.infof("map-existing-users config value: '%s'", mapUsersConfig);
+                if (adapter instanceof UserAdapter && "true".equals(mapUsersConfig)) {
                     shouldMap = true;
                 } else if (adapter instanceof GroupAdapter && "true".equals(this.model.get("map-existing-groups"))) {
                     shouldMap = true;
