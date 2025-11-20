@@ -132,6 +132,20 @@ public class ScimStorageProviderFactory
                 .options("username", "email")
                 .defaultValue("username")
                 .add()
+                .property()
+                .name("map-existing-users")
+                .type(ProviderConfigProperty.BOOLEAN_TYPE)
+                .label("Map to Existing Users on Email Match")
+                .helpText("If enabled, when creating a user fails due to email conflict, map to the existing remote user instead of failing.")
+                .defaultValue(false)
+                .add()
+                .property()
+                .name("map-existing-groups")
+                .type(ProviderConfigProperty.BOOLEAN_TYPE)
+                .label("Map to Existing Groups on Name Match")
+                .helpText("If enabled, when creating a group fails due to name conflict, map to the existing remote group instead of failing.")
+                .defaultValue(false)
+                .add()
                 .build();
     }
 

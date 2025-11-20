@@ -122,16 +122,16 @@ public class ScimClient {
         }
     }
 
-    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void create(Class<A> aClass,
+    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> ServerResponse<S> create(Class<A> aClass,
             M kcModel) {
         var adapter = getAdapter(aClass);
         adapter.apply(kcModel);
         if (adapter.skip) {
-            return;
+            return null;
         }
         // If mapping exist then it was created by import so skip.
         if (adapter.query("findById", adapter.getId()).getResultList().size() != 0) {
-            return;
+            return null;
         }
         LOGGER.debugf("Creating SCIM resource for %s", adapter.getId());
         var retry = registry.retry("create-" + adapter.getId());
@@ -148,12 +148,64 @@ public class ScimClient {
         });
 
         if (!response.isSuccess()){
+            int statusCode = response.getHttpStatus();
+            if (statusCode == 409) {
+                // Check if we should map to existing
+                boolean shouldMap = false;
+                if (adapter instanceof UserAdapter && "true".equals(this.model.get("map-existing-users"))) {
+                    shouldMap = true;
+                } else if (adapter instanceof GroupAdapter && "true".equals(this.model.get("map-existing-groups"))) {
+                    shouldMap = true;
+                }
+                if (shouldMap) {
+                    LOGGER.infof("Create failed with 409 for %s, attempting to map to existing resource", adapter.getId());
+                    try {
+                        // Query for existing resource
+                        String filter = "";
+                        if (adapter instanceof UserAdapter userAdapter) {
+                            String email = userAdapter.getEmail();
+                            if (email != null) {
+                                filter = "emails.value eq \"" + email + "\"";
+                            }
+                        } else if (adapter instanceof GroupAdapter groupAdapter) {
+                            String displayName = groupAdapter.getDisplayName();
+                            if (displayName != null) {
+                                filter = "displayName eq \"" + displayName + "\"";
+                            }
+                        }
+                        if (!filter.isEmpty()) {
+                            ServerResponse<ListResponse<S>> listResponse = scimRequestBuilder
+                                .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
+                                .filter(filter)
+                                .get()
+                                .sendRequest();
+                            if (listResponse.isSuccess()) {
+                                ListResponse<S> listResource = listResponse.getResource();
+                                if (listResource.getTotalResults() > 0) {
+                                    S existingResource = listResource.getListedResources().get(0);
+                                    adapter.apply(existingResource);
+                                    adapter.saveMapping();
+                                    LOGGER.infof("Mapped to existing resource for %s", adapter.getId());
+                                    // Now update it
+                                    this.replace(aClass, kcModel);
+                                    return response; // Return the original failed response, but mapping done
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        LOGGER.errorf("Failed to map to existing resource for %s: %s", adapter.getId(), e.getMessage());
+                    }
+                }
+            }
             LOGGER.warn(response.getResponseBody());
             LOGGER.warn(response.getHttpStatus());
         }
 
-        adapter.apply(response.getResource());
-        adapter.saveMapping();
+        if (response.isSuccess()) {
+            adapter.apply(response.getResource());
+            adapter.saveMapping();
+        }
+        return response;
     };
 
     public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void replace(Class<A> aClass,
@@ -281,8 +333,15 @@ public class ScimClient {
                 var mapping = adapter.getMapping();
                 if (mapping == null) {
                     LOGGER.infof("Creating remote resource for %s", resourceInfo);
-                    this.create(aClass, resource);
-                    trackAdded(syncRes, adapter, resourceInfo);
+                    ServerResponse<S> createResponse = this.create(aClass, resource);
+                    if (createResponse != null && createResponse.isSuccess()) {
+                        trackAdded(syncRes, adapter, resourceInfo);
+                    } else if (adapter.getMapping() != null) {
+                        // Mapped to existing
+                        trackMapped(syncRes, adapter, resourceInfo);
+                    } else {
+                        trackFailed(syncRes, adapter, resourceInfo + " (create failed)");
+                    }
                 } else {
                     LOGGER.infof("Updating remote resource for %s", resourceInfo);
                     this.replace(aClass, resource);
@@ -440,17 +499,17 @@ public class ScimClient {
         }
     }
 
-    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackFailed(SynchronizationResult syncRes, A adapter, String resourceInfo) {
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackMapped(SynchronizationResult syncRes, A adapter, String resourceInfo) {
         if (syncRes instanceof ScimSynchronizationResult scimResult) {
             if (adapter instanceof UserAdapter) {
-                scimResult.addFailedUser(resourceInfo);
+                scimResult.addMappedUser(resourceInfo);
             } else if (adapter instanceof GroupAdapter) {
-                scimResult.addFailedGroup(resourceInfo);
+                scimResult.addMappedGroup(resourceInfo);
             } else {
-                syncRes.increaseFailed();
+                syncRes.increaseUpdated();
             }
         } else {
-            syncRes.increaseFailed();
+            syncRes.increaseUpdated();
         }
     }
 }
