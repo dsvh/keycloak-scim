@@ -177,18 +177,86 @@ public class ScimClient {
                         }
                         if (!filter.isEmpty()) {
                             LOGGER.infof("Searching for existing resource with filter: %s", filter);
-                            ServerResponse<ListResponse<S>> listResponse = scimRequestBuilder
-                                .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
-                                .filter(filter)
-                                .get()
-                                .sendRequest();
-                            LOGGER.infof("List response success: %s, status: %d", listResponse.isSuccess(), listResponse.getHttpStatus());
-                            if (listResponse.isSuccess()) {
+                            ServerResponse<ListResponse<S>> listResponse = null;
+                            boolean usedServerFilter = false;
+                            try {
+                                listResponse = scimRequestBuilder
+                                    .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
+                                    .filter(filter)
+                                    .get()
+                                    .sendRequest();
+                                usedServerFilter = true;
+                                LOGGER.infof("List response success: %s, status: %d", listResponse.isSuccess(), listResponse.getHttpStatus());
+                            } catch (Exception e) {
+                                LOGGER.warnf("Server-side filtering failed, trying client-side filtering: %s", e.getMessage());
+                                // Fallback: fetch all resources and filter client-side
+                                try {
+                                    listResponse = scimRequestBuilder
+                                        .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
+                                        .get()
+                                        .sendRequest();
+                                    usedServerFilter = false;
+                                    LOGGER.infof("Fallback list response success: %s, status: %d", listResponse.isSuccess(), listResponse.getHttpStatus());
+                                } catch (Exception e2) {
+                                    LOGGER.errorf("Both server-side and client-side filtering failed for %s: %s", adapter.getId(), e2.getMessage());
+                                    throw e2; // Re-throw the original exception
+                                }
+                            }
+                            
+                            if (listResponse != null && listResponse.isSuccess()) {
                                 ListResponse<S> listResource = listResponse.getResource();
                                 LOGGER.infof("Total results: %d", listResource.getTotalResults());
-                                if (listResource.getTotalResults() > 0) {
-                                    S existingResource = listResource.getListedResources().get(0);
-                                    LOGGER.infof("Found existing resource: %s", existingResource.getId());
+                                
+                                S existingResource = null;
+                                if (usedServerFilter) {
+                                    // Server-side filtering worked
+                                    if (listResource.getTotalResults() > 0) {
+                                        existingResource = listResource.getListedResources().get(0);
+                                        LOGGER.infof("Found existing resource via server filter: %s", existingResource.getId());
+                                    }
+                                } else {
+                                    // Client-side filtering
+                                    String targetEmail = "";
+                                    String targetDisplayName = "";
+                                    if (adapter instanceof UserAdapter userAdapter) {
+                                        targetEmail = userAdapter.getEmail();
+                                    } else if (adapter instanceof GroupAdapter groupAdapter) {
+                                        targetDisplayName = groupAdapter.getDisplayName();
+                                    }
+                                    
+                                    for (S resource : listResource.getListedResources()) {
+                                        boolean match = false;
+                                        if (adapter instanceof UserAdapter && !targetEmail.isEmpty()) {
+                                            // Check if this resource has the target email
+                                            if (resource instanceof de.captaingoldfish.scim.sdk.common.resources.User user) {
+                                                var emails = user.getEmails();
+                                                if (emails != null) {
+                                                    for (var email : emails) {
+                                                        if (email.getValue().isPresent() && targetEmail.equalsIgnoreCase(email.getValue().get())) {
+                                                            match = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if (adapter instanceof GroupAdapter && !targetDisplayName.isEmpty()) {
+                                            // Check if this resource has the target display name
+                                            if (resource instanceof de.captaingoldfish.scim.sdk.common.resources.Group group) {
+                                                if (targetDisplayName.equals(group.getDisplayName())) {
+                                                    match = true;
+                                                }
+                                            }
+                                        }
+                                        
+                                        if (match) {
+                                            existingResource = resource;
+                                            LOGGER.infof("Found existing resource via client filter: %s", existingResource.getId());
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                if (existingResource != null) {
                                     adapter.apply(existingResource);
                                     adapter.saveMapping();
                                     LOGGER.infof("Mapped to existing resource for %s", adapter.getId());
@@ -199,7 +267,7 @@ public class ScimClient {
                                     LOGGER.infof("No existing resources found with filter: %s", filter);
                                 }
                             } else {
-                                LOGGER.warnf("List request failed: %s", listResponse.getResponseBody());
+                                LOGGER.warnf("List request failed: %s", listResponse != null ? listResponse.getResponseBody() : "null response");
                             }
                         }
                     } catch (Exception e) {
