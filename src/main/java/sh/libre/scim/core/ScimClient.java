@@ -176,22 +176,30 @@ public class ScimClient {
                             }
                         }
                         if (!filter.isEmpty()) {
+                            LOGGER.infof("Searching for existing resource with filter: %s", filter);
                             ServerResponse<ListResponse<S>> listResponse = scimRequestBuilder
                                 .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
                                 .filter(filter)
                                 .get()
                                 .sendRequest();
+                            LOGGER.infof("List response success: %s, status: %d", listResponse.isSuccess(), listResponse.getHttpStatus());
                             if (listResponse.isSuccess()) {
                                 ListResponse<S> listResource = listResponse.getResource();
+                                LOGGER.infof("Total results: %d", listResource.getTotalResults());
                                 if (listResource.getTotalResults() > 0) {
                                     S existingResource = listResource.getListedResources().get(0);
+                                    LOGGER.infof("Found existing resource: %s", existingResource.getId());
                                     adapter.apply(existingResource);
                                     adapter.saveMapping();
                                     LOGGER.infof("Mapped to existing resource for %s", adapter.getId());
                                     // Now update it
                                     this.replace(aClass, kcModel);
                                     return response; // Return the original failed response, but mapping done
+                                } else {
+                                    LOGGER.infof("No existing resources found with filter: %s", filter);
                                 }
+                            } else {
+                                LOGGER.warnf("List request failed: %s", listResponse.getResponseBody());
                             }
                         }
                     } catch (Exception e) {
