@@ -297,17 +297,20 @@ public class ScimClient {
         getAdapter(aClass).getResourceStream().forEach(resource -> {
             var adapter = getAdapter(aClass);
             adapter.apply(resource);
-            LOGGER.infof("Reconciling local resource %s", adapter.getId());
+            String resourceInfo = getResourceInfo(adapter);
+            LOGGER.infof("Reconciling local resource %s: %s", adapter.getId(), resourceInfo);
             if (!adapter.skipRefresh()) {
                 var mapping = adapter.getMapping();
                 if (mapping == null) {
-                    LOGGER.info("Creating it");
+                    LOGGER.infof("Creating remote resource for %s", resourceInfo);
                     this.create(aClass, resource);
                 } else {
-                    LOGGER.info("Replacing it");
+                    LOGGER.infof("Updating remote resource for %s", resourceInfo);
                     this.replace(aClass, resource);
                 }
                 syncRes.increaseUpdated();
+            } else {
+                LOGGER.infof("Skipping refresh for %s", resourceInfo);
             }
         });
 
@@ -328,36 +331,39 @@ public class ScimClient {
                     adapter = getAdapter(aClass);
                     adapter.apply(resource);
 
+                    String resourceInfo = getResourceInfo(adapter);
+                    LOGGER.infof("Processing remote resource: %s", resourceInfo);
+
                     var mapping = adapter.getMapping();
                     if (mapping != null) {
                         adapter.apply(mapping);
                         if (adapter.entityExists()) {
-                            LOGGER.info("Valid mapping found, skipping");
+                            LOGGER.infof("Valid mapping found for %s, skipping", resourceInfo);
                             continue;
                         } else {
-                            LOGGER.info("Delete a dangling mapping");
+                            LOGGER.infof("Deleting dangling mapping for %s", resourceInfo);
                             adapter.deleteMapping();
                         }
                     }
 
                     var mapped = adapter.tryToMap();
                     if (mapped) {
-                        LOGGER.info("Matched");
+                        LOGGER.infof("Matched local resource for %s", resourceInfo);
                         adapter.saveMapping();
                     } else {
                         switch (this.model.get("sync-import-action")) {
                             case "CREATE_LOCAL":
-                                LOGGER.info("Create local resource");
+                                LOGGER.infof("Creating local resource for %s", resourceInfo);
                                 try {
                                     adapter.createEntity();
                                     adapter.saveMapping();
                                     syncRes.increaseAdded();
                                 } catch (Exception e) {
-                                    LOGGER.error(e);
+                                    LOGGER.errorf("Failed to create local resource for %s: %s", resourceInfo, e.getMessage());
                                 }
                                 break;
                             case "DELETE_REMOTE":
-                                LOGGER.info("Delete remote resource");
+                                LOGGER.infof("Deleting remote resource for %s", resourceInfo);
                                 scimRequestBuilder
                                     .delete(genScimUrl(adapter.getSCIMEndpoint(),
                                                        resource.getId().get()),
@@ -368,7 +374,8 @@ public class ScimClient {
                         }
                     }
                 } catch (Exception e) {
-                    LOGGER.error(e);
+                    String resourceInfo = adapter != null ? getResourceInfo(adapter) : "unknown";
+                    LOGGER.errorf("Failed to process resource %s: %s", resourceInfo, e.getMessage());
                     e.printStackTrace();
                     syncRes.increaseFailed();
                 }
@@ -392,5 +399,17 @@ public class ScimClient {
 
     public void close() {
         scimRequestBuilder.close();
+    }
+
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> String getResourceInfo(A adapter) {
+        if (adapter instanceof UserAdapter userAdapter) {
+            String username = userAdapter.getUsername();
+            String email = userAdapter.getEmail();
+            return String.format("User(username=%s, email=%s)", username, email);
+        } else if (adapter instanceof GroupAdapter groupAdapter) {
+            String displayName = groupAdapter.getDisplayName();
+            return String.format("Group(name=%s, id=%s)", displayName, adapter.getId());
+        }
+        return String.format("Resource(id=%s)", adapter.getId());
     }
 }
