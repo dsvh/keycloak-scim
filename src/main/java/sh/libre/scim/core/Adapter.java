@@ -187,7 +187,7 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
         }
     }
 
-    private MultivaluedHashMap<String, String> getModel() {
+    protected MultivaluedHashMap<String, String> getModel() {
         var component = this.session.getContext().getRealm().getComponent(this.componentId);
         if (component != null) {
             return component.getConfig();

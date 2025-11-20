@@ -156,7 +156,10 @@ public class UserAdapter extends Adapter<UserModel, User> {
     public User toSCIM(Boolean addMeta) {
         var user = new User();
         user.setExternalId(id);
-        user.setUserName(username);
+        var model = getModel();
+        String usernameSource = model.getFirst("username-source");
+        String scimUsername = "email".equals(usernameSource) && email != null ? email : username;
+        user.setUserName(scimUsername);
         user.setId(externalId);
         user.setDisplayName(displayName);
         Name name = new Name();

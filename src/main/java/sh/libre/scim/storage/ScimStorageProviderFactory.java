@@ -122,6 +122,13 @@ public class ScimStorageProviderFactory
                 .label("Group filter patterns")
                 .helpText("Comma-separated regex patterns for group names to sync (e.g., 'admin.*,.*test'). Leave empty to sync all groups.")
                 .add()
+                .property()
+                .name("username-attribute")
+                .type(ProviderConfigProperty.STRING_TYPE)
+                .label("Username attribute")
+                .helpText("The user attribute to use as SCIM userName (e.g., 'username' or 'email').")
+                .defaultValue("username")
+                .add()
                 .build();
     }
 
