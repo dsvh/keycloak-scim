@@ -192,33 +192,17 @@ public class ScimClient {
                             LOGGER.warnf("Server-side filtering failed, trying client-side filtering: %s", e.getMessage());
                             // Fallback: fetch all resources and filter client-side
                             List<S> allResources = new ArrayList<>();
-                            int startIndex = 1;
-                            int count = 100;
                             boolean fetchSuccess = false;
                             try {
-                                while (true) {
-                                    ServerResponse<ListResponse<S>> pageResponse = scimRequestBuilder
-                                        .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
-                                        .startIndex(startIndex)
-                                        .count(count)
-                                        .get()
-                                        .sendRequest();
-                                    if (!pageResponse.isSuccess()) {
-                                        LOGGER.warnf("Failed to fetch page at startIndex %d", startIndex);
-                                        if (allResources.isEmpty()) {
-                                            throw new Exception("Failed to fetch any pages");
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    ListResponse<S> page = pageResponse.getResource();
-                                    allResources.addAll(page.getListedResources());
-                                    long total = page.getTotalResults();
-                                    if ((long)allResources.size() >= total) {
-                                        break;
-                                    }
-                                    startIndex += count;
+                                ServerResponse<ListResponse<S>> pageResponse = scimRequestBuilder
+                                    .list("/" + adapter.getSCIMEndpoint(), adapter.getResourceClass())
+                                    .get()
+                                    .sendRequest();
+                                if (!pageResponse.isSuccess()) {
+                                    throw new Exception("Failed to fetch resources");
                                 }
+                                ListResponse<S> page = pageResponse.getResource();
+                                allResources.addAll(page.getListedResources());
                                 fetchSuccess = true;
                                 LOGGER.infof("Fetched %d resources for client-side filtering", allResources.size());
                             } catch (Exception e2) {
