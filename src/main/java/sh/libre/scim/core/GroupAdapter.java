@@ -21,6 +21,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.jboss.logging.Logger;
 import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.UserModel;
 
 public class GroupAdapter extends Adapter<GroupModel, Group> {
 
@@ -62,17 +63,27 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         setExternalId(group.getId().get());
         setDisplayName(group.getDisplayName().get());
         var groupMembers = group.getMembers();
+        var model = getModel();
+        String usernameSource = model != null ? model.getFirst("username-source") : "username";
         if (groupMembers != null && groupMembers.size() > 0) {
             this.members = new HashSet<String>();
             for (var groupMember : groupMembers) {
                 var value = groupMember.getValue().get();
-                // Assume value is email for Databricks
-                var user = session.users().getUserByEmail(realm, value);
+                UserModel user = null;
+                if ("email".equals(usernameSource)) {
+                    user = session.users().getUserByEmail(realm, value);
+                } else {
+                    user = session.users().getUserByUsername(realm, value);
+                }
                 if (user != null) {
                     this.members.add(user.getId());
                 } else {
-                    // Fallback: try to find by username
-                    user = session.users().getUserByUsername(realm, value);
+                    // Fallback: try the other way
+                    if ("email".equals(usernameSource)) {
+                        user = session.users().getUserByUsername(realm, value);
+                    } else {
+                        user = session.users().getUserByEmail(realm, value);
+                    }
                     if (user != null) {
                         this.members.add(user.getId());
                     }
@@ -87,15 +98,18 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         group.setId(externalId);
         group.setExternalId(id);
         group.setDisplayName(displayName);
+        var model = getModel();
+        String usernameSource = model != null ? model.getFirst("username-source") : "username";
         if (members.size() > 0) {
             var groupMembers = new ArrayList<Member>();
             for (var member : members) {
                 var groupMember = new Member();
                 try {
                     var user = session.users().getUserById(realm, member);
-                    if (user != null && user.getEmail() != null) {
-                        groupMember.setValue(user.getEmail());
-                        var ref = new URI(String.format("Users/%s", user.getEmail()));
+                    if (user != null) {
+                        String scimUsername = "email".equals(usernameSource) && user.getEmail() != null ? user.getEmail() : user.getUsername();
+                        groupMember.setValue(scimUsername);
+                        var ref = new URI(String.format("Users/%s", scimUsername));
                         groupMember.setRef(ref.toString());
                         groupMembers.add(groupMember);
                     }
@@ -171,11 +185,14 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         List<Member> groupMembers = new ArrayList<>();
         PatchBuilder<Group> patchBuilder;
         patchBuilder = scimRequestBuilder.patch(url, Group.class);
+        var model = getModel();
+        String usernameSource = model != null ? model.getFirst("username-source") : "username";
         if (members.size() > 0) {
             for (String member : members) {
                 var user = session.users().getUserById(realm, member);
-                if (user != null && user.getEmail() != null) {
-                    groupMembers.add(Member.builder().value(user.getEmail()).build());
+                if (user != null) {
+                    String scimUsername = "email".equals(usernameSource) && user.getEmail() != null ? user.getEmail() : user.getUsername();
+                    groupMembers.add(Member.builder().value(scimUsername).build());
                 }
             }
             patchBuilder.addOperation()
