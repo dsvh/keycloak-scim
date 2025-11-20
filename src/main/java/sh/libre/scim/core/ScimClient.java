@@ -21,6 +21,7 @@ import org.keycloak.connections.jpa.JpaConnectionProvider;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RoleMapperModel;
 import org.keycloak.storage.user.SynchronizationResult;
+import sh.libre.scim.storage.ScimSynchronizationResult;
 
 import com.google.common.net.HttpHeaders;
 
@@ -304,11 +305,12 @@ public class ScimClient {
                 if (mapping == null) {
                     LOGGER.infof("Creating remote resource for %s", resourceInfo);
                     this.create(aClass, resource);
+                    trackAdded(syncRes, adapter, resourceInfo);
                 } else {
                     LOGGER.infof("Updating remote resource for %s", resourceInfo);
                     this.replace(aClass, resource);
+                    trackUpdated(syncRes, adapter, resourceInfo);
                 }
-                syncRes.increaseUpdated();
             } else {
                 LOGGER.infof("Skipping refresh for %s", resourceInfo);
             }
@@ -357,19 +359,25 @@ public class ScimClient {
                                 try {
                                     adapter.createEntity();
                                     adapter.saveMapping();
-                                    syncRes.increaseAdded();
+                                    trackAdded(syncRes, adapter, resourceInfo);
                                 } catch (Exception e) {
                                     LOGGER.errorf("Failed to create local resource for %s: %s", resourceInfo, e.getMessage());
+                                    trackFailed(syncRes, adapter, resourceInfo + " (create failed: " + e.getMessage() + ")");
                                 }
                                 break;
                             case "DELETE_REMOTE":
                                 LOGGER.infof("Deleting remote resource for %s", resourceInfo);
-                                scimRequestBuilder
-                                    .delete(genScimUrl(adapter.getSCIMEndpoint(),
-                                                       resource.getId().get()),
-                                                       adapter.getResourceClass())
-                                    .sendRequest();
-                                syncRes.increaseRemoved();
+                                try {
+                                    scimRequestBuilder
+                                        .delete(genScimUrl(adapter.getSCIMEndpoint(),
+                                                           resource.getId().get()),
+                                                           adapter.getResourceClass())
+                                        .sendRequest();
+                                    trackRemoved(syncRes, adapter, resourceInfo);
+                                } catch (Exception e) {
+                                    LOGGER.errorf("Failed to delete remote resource for %s: %s", resourceInfo, e.getMessage());
+                                    trackFailed(syncRes, adapter, resourceInfo + " (delete failed: " + e.getMessage() + ")");
+                                }
                                 break;
                         }
                     }
@@ -377,7 +385,7 @@ public class ScimClient {
                     String resourceInfo = adapter != null ? getResourceInfo(adapter) : "unknown";
                     LOGGER.errorf("Failed to process resource %s: %s", resourceInfo, e.getMessage());
                     e.printStackTrace();
-                    syncRes.increaseFailed();
+                    trackFailed(syncRes, adapter, resourceInfo + " (processing failed: " + e.getMessage() + ")");
                 }
             }
         } catch (ResponseException e) {
@@ -411,5 +419,61 @@ public class ScimClient {
             return String.format("Group(name=%s, id=%s)", displayName, adapter.getId());
         }
         return String.format("Resource(id=%s)", adapter.getId());
+    }
+
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackAdded(SynchronizationResult syncRes, A adapter, String resourceInfo) {
+        if (syncRes instanceof ScimSynchronizationResult scimResult) {
+            if (adapter instanceof UserAdapter) {
+                scimResult.addAddedUser(resourceInfo);
+            } else if (adapter instanceof GroupAdapter) {
+                scimResult.addAddedGroup(resourceInfo);
+            } else {
+                syncRes.increaseAdded();
+            }
+        } else {
+            syncRes.increaseAdded();
+        }
+    }
+
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackUpdated(SynchronizationResult syncRes, A adapter, String resourceInfo) {
+        if (syncRes instanceof ScimSynchronizationResult scimResult) {
+            if (adapter instanceof UserAdapter) {
+                scimResult.addUpdatedUser(resourceInfo);
+            } else if (adapter instanceof GroupAdapter) {
+                scimResult.addUpdatedGroup(resourceInfo);
+            } else {
+                syncRes.increaseUpdated();
+            }
+        } else {
+            syncRes.increaseUpdated();
+        }
+    }
+
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackRemoved(SynchronizationResult syncRes, A adapter, String resourceInfo) {
+        if (syncRes instanceof ScimSynchronizationResult scimResult) {
+            if (adapter instanceof UserAdapter) {
+                scimResult.addRemovedUser(resourceInfo);
+            } else if (adapter instanceof GroupAdapter) {
+                scimResult.addRemovedGroup(resourceInfo);
+            } else {
+                syncRes.increaseRemoved();
+            }
+        } else {
+            syncRes.increaseRemoved();
+        }
+    }
+
+    private <M extends RoleMapperModel, A extends Adapter<M, ?>> void trackFailed(SynchronizationResult syncRes, A adapter, String resourceInfo) {
+        if (syncRes instanceof ScimSynchronizationResult scimResult) {
+            if (adapter instanceof UserAdapter) {
+                scimResult.addFailedUser(resourceInfo);
+            } else if (adapter instanceof GroupAdapter) {
+                scimResult.addFailedGroup(resourceInfo);
+            } else {
+                syncRes.increaseFailed();
+            }
+        } else {
+            syncRes.increaseFailed();
+        }
     }
 }

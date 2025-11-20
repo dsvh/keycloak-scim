@@ -17,6 +17,8 @@ import org.keycloak.storage.UserStorageProviderFactory;
 import org.keycloak.storage.UserStorageProviderModel;
 import org.keycloak.storage.user.ImportSynchronization;
 import org.keycloak.storage.user.SynchronizationResult;
+import java.util.ArrayList;
+import java.util.List;
 
 import sh.libre.scim.core.GroupAdapter;
 import sh.libre.scim.core.ScimDispatcher;
@@ -153,7 +155,7 @@ public class ScimStorageProviderFactory
     public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId,
             UserStorageProviderModel model) {
         LOGGER.info("sync");
-        var result = new SynchronizationResult();
+        var result = new ScimSynchronizationResult();
         KeycloakModelUtils.runJobInTransaction(sessionFactory, new KeycloakSessionTask() {
 
             @Override
