@@ -87,9 +87,9 @@ public class ScimClient {
     protected ScimClientConfig genScimClientConfig() {
         return ScimClientConfig.builder()
         .httpHeaders(defaultHeaders)
-        .connectTimeout(5)
-        .requestTimeout(5)
-        .socketTimeout(5)
+        .connectTimeout(30)
+        .requestTimeout(30)
+        .socketTimeout(30)
         .expectedHttpResponseHeaders(expectedResponseHeaders)
         .hostnameVerifier((s, sslSession) -> true)
         .build();
@@ -142,7 +142,8 @@ public class ScimClient {
                 LOGGER.warnf("Failed to fetch resources: HTTP %d - %s", pageResponse.getHttpStatus(), pageResponse.getResponseBody());
             }
         } catch (Exception e) {
-            LOGGER.errorf("Failed to fetch resources: %s", e.getMessage(), e);
+            LOGGER.error("Failed to fetch resources", e);
+            LOGGER.errorf("Failed to fetch resources: %s", e.getMessage());
         }
         return allResources;
     }
