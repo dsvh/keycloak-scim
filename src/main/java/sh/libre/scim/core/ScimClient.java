@@ -126,8 +126,8 @@ public class ScimClient {
     private <S extends ResourceNode> List<S> fetchAllResources(String endpoint, Class<S> resourceClass) {
         List<S> allResources = new ArrayList<>();
         try {
-            String listUrl = "/" + endpoint;
-            LOGGER.infof("Sending SCIM list request to URL: %s%s", scimApplicationBaseUrl, listUrl);
+            String listUrl = scimApplicationBaseUrl + "/" + endpoint;
+            LOGGER.infof("Sending SCIM list request to URL: %s", listUrl);
             ServerResponse<ListResponse<S>> pageResponse = scimRequestBuilder
                 .list(listUrl, resourceClass)
                 .get()
