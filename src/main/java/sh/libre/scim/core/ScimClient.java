@@ -127,16 +127,16 @@ public class ScimClient {
         List<S> allResources = new ArrayList<>();
         try {
             String listUrl = "/" + endpoint;
-            LOGGER.debugf("Sending SCIM list request to URL: %s%s", scimApplicationBaseUrl, listUrl);
+            LOGGER.infof("Sending SCIM list request to URL: %s%s", scimApplicationBaseUrl, listUrl);
             ServerResponse<ListResponse<S>> pageResponse = scimRequestBuilder
                 .list(listUrl, resourceClass)
                 .get()
                 .sendRequest();
-            LOGGER.debug("Received response for list request: status=" + pageResponse.getHttpStatus() + ", success=" + pageResponse.isSuccess());
+            LOGGER.info("Received response for list request: status=" + pageResponse.getHttpStatus() + ", success=" + pageResponse.isSuccess());
             if (pageResponse.isSuccess()) {
                 ListResponse<S> page = pageResponse.getResource();
                 allResources.addAll(page.getListedResources());
-                LOGGER.debugf("Fetched %d resources from response", allResources.size());
+                LOGGER.infof("Fetched %d resources from response", allResources.size());
                 // Note: Assuming Databricks returns all resources in one page or we take the first page
             } else {
                 LOGGER.warnf("Failed to fetch resources: HTTP %d - %s", pageResponse.getHttpStatus(), pageResponse.getResponseBody());
