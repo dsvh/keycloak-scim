@@ -314,6 +314,33 @@ public class ScimClient {
                     // For now, just patch members since that's the main issue
                     // TODO: Add support for patching displayName and externalId separately
                     response = adapter.toPatchBuilder(scimRequestBuilder, url).sendRequest();
+                    
+                    // Check if PATCH also failed with 404/400 (group not found)
+                    if (!response.isSuccess()) {
+                        int patchStatusCode = response.getHttpStatus();
+                        if (patchStatusCode == 404 || patchStatusCode == 400) {
+                            // Resource doesn't exist, create it
+                            LOGGER.infof("Resource %s not found after PATCH (%d), creating instead", adapter.getId(), patchStatusCode);
+                            ServerResponse<S> createResponse = scimRequestBuilder
+                                .create(adapter.getResourceClass(), ("/" + adapter.getSCIMEndpoint()).formatted())
+                                .setResource(adapter.toSCIM(false))
+                                .sendRequest();
+                            if (createResponse.isSuccess()) {
+                                // Update the existing mapping with the new externalId
+                                adapter.apply(createResponse.getResource());
+                                var existingMapping = adapter.getMapping();
+                                if (existingMapping != null) {
+                                    existingMapping.setExternalId(adapter.getExternalId());
+                                    getEM().merge(existingMapping);
+                                } else {
+                                    adapter.saveMapping();
+                                }
+                                response = createResponse; // Use the successful create response
+                            } else {
+                                response = createResponse; // Return the failed create response for logging
+                            }
+                        }
+                    }
                 } else if (statusCode == 404 || statusCode == 400) {
                     // Resource doesn't exist, create it
                     LOGGER.infof("Resource %s not found (%d), creating instead", adapter.getId(), statusCode);
