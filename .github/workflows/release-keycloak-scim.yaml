@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 
 jobs:
+  # A release must not be able to ship a jar that shadows Keycloak's own libraries, so run the same
+  # checks the PR runs and gate the release on them.
+  validate:
+    uses: ./.github/workflows/validate.yaml
+
   build:
+    needs: validate
     runs-on: ubuntu-24.04
 
     steps:
@@ -32,6 +38,14 @@ jobs:
 
       - name: Build with Gradle
         run: ./gradlew shadowJar
+
+      # Belt and braces: `validate` proved the checked-in source is clean, this proves the exact
+      # jar about to be attached to the release is.
+      - name: Check for classpath collisions with Keycloak
+        run: ./.github/scripts/check-classpath-overlap.sh
+
+      - name: Smoke-test the plugin on a real Keycloak
+        run: ./.github/scripts/smoke-test-plugin.sh
 
       - name: Create Release with jar file
         uses: softprops/action-gh-release@v1

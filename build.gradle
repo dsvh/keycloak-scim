@@ -31,8 +31,12 @@ dependencies {
     rewrite(platform("org.openrewrite.recipe:rewrite-recipe-bom:2.20.0"))
     rewrite("org.openrewrite.recipe:rewrite-migrate-java")
     implementation 'io.github.resilience4j:resilience4j-retry:2.2.0'
-    implementation "jakarta.ws.rs:jakarta.ws.rs-api:4.0.0"
-    implementation "jakarta.persistence:jakarta.persistence-api:3.2.0"
+    // compileOnly + pinned to the versions Keycloak 26.4.6 actually ships, so the COMPILER enforces
+    // the plugin only uses API that exists at runtime. Previously these were `implementation` at
+    // jakarta.ws.rs 4.0.0, which both compiled against API the server does not have AND shipped a
+    // JAX-RS 4.0 copy in the fat jar that shadowed the server's 3.1.0. See the shadowJar note below.
+    compileOnly "jakarta.ws.rs:jakarta.ws.rs-api:3.1.0"
+    compileOnly "jakarta.persistence:jakarta.persistence-api:3.2.0"
     compileOnly 'org.keycloak:keycloak-core:25.0.6'
     compileOnly 'org.keycloak:keycloak-server-spi:25.0.6'
     compileOnly 'org.keycloak:keycloak-server-spi-private:25.0.6'
@@ -71,12 +75,27 @@ shadowJar {
     relocate 'org.apache.http', 'sh.libre.scim.shaded.org.apache.http'
     relocate 'org.apache.commons', 'sh.libre.scim.shaded.org.apache.commons'
 
-    // EXCLUDE BouncyCastle rather than relocating it. BC ships as a signed jar and registers a JCE
-    // provider under a fixed name; relocation renames the provider classes and breaks that
-    // registration (and any self-integrity checks). Keycloak already ships BouncyCastle, so the
-    // plugin can simply use the server's.
+    // EXCLUDE the rest rather than relocating. Either relocation is unsafe, or the library is a
+    // shared contract with the server that the plugin must NOT keep a private copy of.
     dependencies {
+        // BouncyCastle ships as a signed jar and registers a JCE provider under a fixed name;
+        // relocation renames the provider classes and breaks that registration (and any
+        // self-integrity checks). Keycloak already ships BouncyCastle - use the server's.
         exclude(dependency('org.bouncycastle:.*:.*'))
+
+        // Jakarta EE APIs are the contract BETWEEN the plugin and Keycloak - relocating them would
+        // mean the plugin implements interfaces the server has never heard of. So they must come
+        // from the server, not from here. Note the skew this was hiding: the plugin declared
+        // jakarta.ws.rs-api 4.0.0 while Keycloak 26.4.6 ships 3.1.0, so the fat jar was silently
+        // upgrading JAX-RS to 4.0 for the WHOLE server - the same shape of landmine as the
+        // Jackson one that actually went off.
+        exclude(dependency('jakarta.ws.rs:jakarta.ws.rs-api:.*'))
+        exclude(dependency('jakarta.persistence:jakarta.persistence-api:.*'))
+
+        // slf4j-api is bound at runtime to ONE provider via ServiceLoader. Keycloak ships
+        // slf4j-api 2.0.17 plus slf4j-jboss-logmanager; a second api copy on the classpath is how
+        // you get logs that vanish or a provider-mismatch warning at boot.
+        exclude(dependency('org.slf4j:.*:.*'))
     }
 
     // Relocation rewrites class names inside META-INF/services entries too; merging keeps the
@@ -92,13 +111,17 @@ tasks.register('verifyNoClasspathPollution') {
     group = 'verification'
     dependsOn shadowJarTask
     doLast {
-        def forbidden = ['com/fasterxml/jackson/', 'org/bouncycastle/', 'org/apache/http/', 'org/apache/commons/']
+        def forbidden = ['com/fasterxml/jackson/', 'org/bouncycastle/', 'org/apache/http/',
+                         'org/apache/commons/', 'jakarta/', 'org/slf4j/']
         def jarFile = shadowJarTask.get().archiveFile.get().asFile
         def offenders = [] as Set
         new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
             for (entry in zf.entries()) {
+                // Multi-release jars carry a second copy of some classes under
+                // META-INF/versions/<N>/; strip that prefix so those are checked too.
+                def name = entry.name.replaceFirst(/^META-INF\/versions\/\d+\//, '')
                 for (prefix in forbidden) {
-                    if (entry.name.startsWith(prefix)) { offenders << prefix }
+                    if (name.startsWith(prefix)) { offenders << prefix }
                 }
             }
         }
