@@ -5,10 +5,15 @@ plugins {
 }
 
 group = 'sh.libre.scim'
-version = '1.4'
+version = '1.5'
 description = 'keycloak-scim'
 
 java.sourceCompatibility = JavaVersion.VERSION_17
+
+// Pin the artifact name. Gradle otherwise derives it from the checkout DIRECTORY name, so a build
+// from a differently-named directory silently produces e.g. `w-1.5-all.jar`. Consumers pin the
+// release asset by URL (and by sha256), so the filename must not depend on where it was built.
+base.archivesName = 'keycloak-scim'
 
 rewrite {
     activeRecipe(
@@ -40,3 +45,73 @@ dependencies {
     implementation 'de.captaingoldfish:scim-sdk-client:1.25.1'
     implementation 'org.apache.commons:commons-lang3:3.17.0'
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Keycloak loads provider jars from /opt/keycloak/providers onto its OWN classpath. Anything this
+// fat jar bundles therefore SHADOWS Keycloak's copy of the same library, for the whole server -
+// not just for this plugin.
+//
+// This bit us in production (Keycloak 26.4.6, 2026-08-20). v1.4 bundled jackson-core 2.17.2, which
+// took precedence over Keycloak's newer Jackson. Keycloak's webauthn4j is compiled against the
+// newer one, so at passkey verification it called
+//     com.fasterxml.jackson.core.base.ParserMinimalBase.<init>(int, StreamReadConstraints)
+// which does not exist in 2.17.2, and threw NoSuchMethodError. Every WebAuthn/passkey login on the
+// realm returned HTTP 500. Password and IdP logins were unaffected, because they never reach
+// webauthn4j - which is why it was not caught by a smoke test.
+//
+// The Keycloak artifacts above are already correctly `compileOnly`, but scim-sdk-* / resilience4j
+// are `implementation`, so shadow bundles their transitives: Jackson, BouncyCastle, Apache
+// HttpClient and commons. Keycloak ships all four.
+// ---------------------------------------------------------------------------------------------
+shadowJar {
+    // RELOCATE what we need our own copy of. The plugin keeps the exact versions scim-sdk was
+    // built against, under a private package, and Keycloak keeps its own. No coupling either way.
+    relocate 'com.fasterxml.jackson', 'sh.libre.scim.shaded.com.fasterxml.jackson'
+    relocate 'org.apache.http', 'sh.libre.scim.shaded.org.apache.http'
+    relocate 'org.apache.commons', 'sh.libre.scim.shaded.org.apache.commons'
+
+    // EXCLUDE BouncyCastle rather than relocating it. BC ships as a signed jar and registers a JCE
+    // provider under a fixed name; relocation renames the provider classes and breaks that
+    // registration (and any self-integrity checks). Keycloak already ships BouncyCastle, so the
+    // plugin can simply use the server's.
+    dependencies {
+        exclude(dependency('org.bouncycastle:.*:.*'))
+    }
+
+    // Relocation rewrites class names inside META-INF/services entries too; merging keeps the
+    // ServiceLoader files of relocated libraries (e.g. Jackson modules) valid.
+    mergeServiceFiles()
+}
+
+// Fails the build if a library Keycloak also provides would land at the root of the jar - i.e. on
+// Keycloak's classpath. This is the regression guard for the incident described above.
+def shadowJarTask = tasks.named('shadowJar')
+tasks.register('verifyNoClasspathPollution') {
+    description = 'Fails if the shaded jar would shadow a library Keycloak already provides.'
+    group = 'verification'
+    dependsOn shadowJarTask
+    doLast {
+        def forbidden = ['com/fasterxml/jackson/', 'org/bouncycastle/', 'org/apache/http/', 'org/apache/commons/']
+        def jarFile = shadowJarTask.get().archiveFile.get().asFile
+        def offenders = [] as Set
+        new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
+            for (entry in zf.entries()) {
+                for (prefix in forbidden) {
+                    if (entry.name.startsWith(prefix)) { offenders << prefix }
+                }
+            }
+        }
+        if (!offenders.isEmpty()) {
+            throw new GradleException(
+                "${jarFile.name} still bundles unrelocated packages that Keycloak also provides: " +
+                "${offenders.sort().join(', ')}. These would shadow Keycloak's own copies and can " +
+                "break unrelated server features (see the shadowJar comment above). Relocate or exclude them.")
+        }
+        logger.lifecycle("verifyNoClasspathPollution: OK - ${jarFile.name} bundles no unrelocated Keycloak-provided packages")
+    }
+}
+// The release workflow runs `./gradlew shadowJar` directly, not `check` - so wire the guard as a
+// finalizer too, otherwise a release could ship an unrelocated jar without the check ever running.
+shadowJarTask.configure { finalizedBy 'verifyNoClasspathPollution' }
+tasks.named('check') { dependsOn 'verifyNoClasspathPollution' }
