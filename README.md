@@ -136,6 +136,21 @@ run locally against a built jar:
 ./.github/scripts/smoke-test-plugin.sh
 ```
 
+### Releasing
+
+`Build keycloak-scim and release` publishes a GitHub release named after `version` in
+`build.gradle`. It runs the checks above first, and **will not republish a version that already
+exists** — bump `version` to cut a new one.
+
+That matters because consumers pin the asset by URL *and* sha256 (the Keycloak initContainer in
+`daikin-dsv/deploy` verifies the digest and refuses to start the pod on a mismatch). Gradle jars are
+not byte-reproducible, so republishing the same version behind the same URL would break every pinned
+consumer.
+
+It also means a release can be cut from a branch via `workflow_dispatch`, tested on a real cluster,
+and merged afterwards — the merge run finds the version already published and stops, so the bytes
+that were tested are the bytes that stay.
+
 ### When bumping the target Keycloak version
 
 Change `keycloakServerVersion` in `gradle.properties` and let checks 2 and 3 re-run against it. If

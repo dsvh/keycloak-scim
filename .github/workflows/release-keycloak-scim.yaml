@@ -36,6 +36,29 @@ jobs:
       - name: Get version
         run: echo "VERSION=$(./gradlew -q properties | grep '^version:' | cut -d' ' -f2)" >> $GITHUB_ENV
 
+      # A published release is IMMUTABLE, because consumers pin the asset by URL *and* sha256 - the
+      # Keycloak initContainer in daikin-dsv/deploy verifies the digest and refuses to start the pod
+      # on a mismatch. Re-running this workflow for a version that already exists would rebuild the
+      # jar (Gradle jars are not byte-reproducible) and replace the asset behind an unchanged URL,
+      # breaking every pinned consumer.
+      #
+      # This is also what makes it safe to cut a release from a branch via workflow_dispatch, test
+      # that exact jar on a cluster, and only then merge: the push-to-main run finds the version
+      # already published and stops, so the bytes that were tested are the bytes that stay.
+      #
+      # To publish again, bump `version` in build.gradle.
+      - name: Check whether this version is already published
+        id: released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::v${VERSION} is already published - not republishing. Bump 'version' in build.gradle to cut a new release."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build with Gradle
         run: ./gradlew shadowJar
 
@@ -48,6 +71,7 @@ jobs:
         run: ./.github/scripts/smoke-test-plugin.sh
 
       - name: Create Release with jar file
+        if: steps.released.outputs.exists == 'false'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: "v${{ env.VERSION }}"
