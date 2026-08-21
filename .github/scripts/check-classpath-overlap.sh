@@ -20,7 +20,8 @@
 # anyone having to predict it.
 #
 # Usage: check-classpath-overlap.sh [path/to/plugin.jar] [keycloak-version]
-# Defaults: the built shadow jar, and keycloakServerVersion from gradle.properties.
+# Defaults: the built shadow jar, and EVERY version in keycloakServerVersions (gradle.properties).
+# Pass a version to check just that one.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,13 +35,23 @@ if [[ -z "$jar" || ! -f "$jar" ]]; then
   exit 2
 fi
 
-kc_version="${2:-$(grep -E '^keycloakServerVersion=' "$repo_root/gradle.properties" | cut -d= -f2)}"
-if [[ -z "$kc_version" ]]; then
-  echo "error: could not determine Keycloak version (gradle.properties: keycloakServerVersion)." >&2
+# Versions to check: an explicit argument wins, otherwise every version in gradle.properties.
+# A jar is only "safe" for a server build we actually tested it against, and the fleet runs several
+# at once - so the default is ALL of them, not the newest.
+versions_to_check() {
+  if [[ -n "${1:-}" ]]; then
+    echo "$1"
+    return
+  fi
+  grep -E '^keycloakServerVersions=' "$repo_root/gradle.properties" | cut -d= -f2 | tr ',' ' '
+}
+
+kc_versions="$(versions_to_check "${2:-}")"
+if [[ -z "${kc_versions// /}" ]]; then
+  echo "error: no Keycloak versions to check (gradle.properties: keycloakServerVersions)." >&2
   exit 2
 fi
 
-image="quay.io/keycloak/keycloak:${kc_version}"
 # Everything the plugin is allowed to own. Relocated copies live under sh/libre/scim/shaded/, so
 # this one prefix covers them too.
 own_prefix="sh/libre/scim"
@@ -49,7 +60,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 echo "plugin jar : $jar"
-echo "keycloak   : $image"
+echo "versions   : $kc_versions"
 echo
 
 # Java packages inside a jar, one per line, as slash-separated paths.
@@ -65,39 +76,65 @@ packages_of() {
     | sed 's#/[^/]*$##'
 }
 
-echo "==> extracting Keycloak's classpath from $image"
-docker pull -q "$image" >/dev/null
-cid="$(docker create "$image")"
-docker cp "$cid:/opt/keycloak/lib" "$work/lib" >/dev/null
-docker rm -f "$cid" >/dev/null
-
-find "$work/lib" -name '*.jar' -print0 | xargs -0 -n1 -- bash -c 'unzip -Z1 "$0" 2>/dev/null || true' \
-  | grep '\.class$' \
-  | sed -E 's#^META-INF/versions/[0-9]+/##' \
-  | grep '/' \
-  | sed 's#/[^/]*$##' \
-  | sort -u > "$work/keycloak.txt"
-
+# The plugin's own package set does not change per Keycloak version - compute it once.
 packages_of "$jar" | sort -u > "$work/plugin.txt"
-
-kc_jars=$(find "$work/lib" -name '*.jar' | wc -l | tr -d ' ')
-echo "    $kc_jars jars, $(wc -l < "$work/keycloak.txt" | tr -d ' ') packages on Keycloak's classpath"
 echo "    $(wc -l < "$work/plugin.txt" | tr -d ' ') packages in the plugin jar"
 echo
 
-comm -12 "$work/keycloak.txt" "$work/plugin.txt" | grep -v "^${own_prefix}" > "$work/overlap.txt" || true
+# Checks ONE Keycloak version. Returns non-zero on a collision; the caller keeps going so a run
+# reports every bad version, not just the first.
+check_version() {
+  local kc_version="$1"
+  local image="quay.io/keycloak/keycloak:${kc_version}"
+  local d="$work/$kc_version"
+  mkdir -p "$d"
 
-if [[ -s "$work/overlap.txt" ]]; then
-  echo "FAIL: the plugin jar bundles packages Keycloak also provides."
-  echo
-  echo "These would shadow Keycloak's own copies for the ENTIRE server, and can break server"
-  echo "features that have nothing to do with SCIM:"
-  echo
-  total=$(wc -l < "$work/overlap.txt" | tr -d ' ')
-  sed 's#/#.#g; s#^#  - #' "$work/overlap.txt" | head -25
-  if (( total > 25 )); then
-    echo "  ... and $(( total - 25 )) more ($total colliding packages in total)"
+  echo "==> Keycloak ${kc_version}: extracting the classpath from $image"
+  docker pull -q "$image" >/dev/null
+  local cid
+  cid="$(docker create "$image")"
+  docker cp "$cid:/opt/keycloak/lib" "$d/lib" >/dev/null
+  docker rm -f "$cid" >/dev/null
+
+  find "$d/lib" -name '*.jar' -print0 | xargs -0 -n1 -- bash -c 'unzip -Z1 "$0" 2>/dev/null || true' \
+    | grep '\.class$' \
+    | sed -E 's#^META-INF/versions/[0-9]+/##' \
+    | grep '/' \
+    | sed 's#/[^/]*$##' \
+    | sort -u > "$d/keycloak.txt"
+
+  local kc_jars
+  kc_jars=$(find "$d/lib" -name '*.jar' | wc -l | tr -d ' ')
+  echo "    $kc_jars jars, $(wc -l < "$d/keycloak.txt" | tr -d ' ') packages on Keycloak's classpath"
+
+  comm -12 "$d/keycloak.txt" "$work/plugin.txt" | grep -v "^${own_prefix}" > "$d/overlap.txt" || true
+
+  if [[ -s "$d/overlap.txt" ]]; then
+    local total
+    total=$(wc -l < "$d/overlap.txt" | tr -d ' ')
+    echo "    FAIL: $total package(s) collide with Keycloak ${kc_version}:"
+    sed 's#/#.#g; s#^#      - #' "$d/overlap.txt" | head -25
+    if (( total > 25 )); then
+      echo "      ... and $(( total - 25 )) more"
+    fi
+    return 1
   fi
+
+  echo "    PASS: no collision with Keycloak ${kc_version}"
+  return 0
+}
+
+failed=()
+for v in $kc_versions; do
+  check_version "$v" || failed+=("$v")
+  echo
+done
+
+if (( ${#failed[@]} )); then
+  echo "FAIL: the plugin jar bundles packages Keycloak also provides, on: ${failed[*]}"
+  echo
+  echo "Those packages would shadow Keycloak's own copies for the ENTIRE server, and can break"
+  echo "server features that have nothing to do with SCIM."
   echo
   echo "Fix in build.gradle's shadowJar block, choosing per library:"
   echo "  * relocate(...)  - the plugin needs its own private copy (e.g. Jackson for scim-sdk)"
@@ -106,4 +143,4 @@ if [[ -s "$work/overlap.txt" ]]; then
   exit 1
 fi
 
-echo "PASS: no package in the plugin jar collides with Keycloak ${kc_version}'s classpath."
+echo "PASS: the plugin jar collides with none of: ${kc_versions}"

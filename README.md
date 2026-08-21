@@ -119,7 +119,7 @@ jar also exists on Keycloak's classpath. The forbidden set is derived, not hardc
 transitive dependency that happens to collide is caught by name on the PR that adds it.
 
 This is the check that would have stopped the outage: run it against the v1.4 release jar and it
-reports 380 colliding packages.
+reports **410** colliding packages on 26.4.6 and **395** on 26.6.4.
 
 **3. `.github/scripts/smoke-test-plugin.sh` — the complement.**
 Boots a real Keycloak with the jar mounted and asserts the plugin still registers all three of its
@@ -127,8 +127,8 @@ SPIs, with no linkage errors in the log. Check 2 pushes toward removing things f
 one catches removing too much. Note it does **not** catch the outage on its own — v1.4 boots and
 registers fine, because the breakage was at request time, in a code path only passkey login reaches.
 
-Both scripts take the Keycloak version from `keycloakServerVersion` in `gradle.properties`, and both
-run locally against a built jar:
+Both scripts check **every** version listed in `keycloakServerVersions` in `gradle.properties`, and
+both run locally against a built jar:
 
 ```sh
 ./gradlew check
@@ -151,12 +151,27 @@ It also means a release can be cut from a branch via `workflow_dispatch`, tested
 and merged afterwards — the merge run finds the version already published and stops, so the bytes
 that were tested are the bytes that stay.
 
-### When bumping the target Keycloak version
+### When the target Keycloak versions change
 
-Change `keycloakServerVersion` in `gradle.properties` and let checks 2 and 3 re-run against it. If
-check 2 starts failing, the new server ships a library the plugin bundles — relocate or exclude it
-using the table above. If the `compileOnly` Jakarta versions no longer match what the new server
-ships, update those too.
+`keycloakServerVersions` in `gradle.properties` is a **list**, and checks 2 and 3 run against every
+entry. That is deliberate: a provider jar sits on the server's own classpath, so "this jar is safe"
+is a claim about a specific server build — and the fleet runs several at once. During a blue/green
+Keycloak upgrade one cluster serves two versions from a single values block, and production is
+usually the *older* one. Validating only the newest would leave production unverified for exactly
+the weeks an upgrade is in flight.
+
+So: **add** a version before the upgrade reaches a cluster, and **remove** it once no cluster runs
+it. Don't swap.
+
+If check 2 starts failing on a newly added version, that server ships a library the plugin bundles —
+relocate or exclude it using the table above. If the `compileOnly` Jakarta versions no longer match
+what it ships, update those too.
+
+To check a single version ad hoc, pass it explicitly:
+
+```sh
+./.github/scripts/check-classpath-overlap.sh build/libs/keycloak-scim-1.5-all.jar 26.6.4
+```
 
 
 **[License AGPL](/LICENSE)**
