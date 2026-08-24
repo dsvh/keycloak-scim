@@ -325,6 +325,10 @@ public class ScimClient {
         if (!inScope(adapter)) {
             return null;
         }
+        // The create path serialises members through toSCIM(), which needs the same email resolver the
+        // patch path uses. Without this, creating a group whose members have no mapping row is
+        // impossible - which is exactly how the first ss-qa rehearsal failed on 'scimtest-beta'.
+        primeGroupDelta(adapter);
         // If mapping exist then it was created by import so skip.
         if (adapter.query("findById", adapter.getId()).getResultList().size() != 0) {
             return null;
@@ -505,8 +509,19 @@ public class ScimClient {
             }
             return true;
         } catch (NoResultException e) {
-            LOGGER.warnf("failed to replace resource %s, scim mapping not found", adapter.getId());
-            return false;
+            // No local mapping row yet. refreshResources() handles this by calling create(), but the
+            // EVENT path calls replace() directly - so without this fallback a group that has never been
+            // synced can never be bootstrapped from a membership change, which is what happened to
+            // scimtest-alpha/beta on ss-qa. create() maps to an existing remote group by name when
+            // map-existing-groups is on, or creates it.
+            LOGGER.infof("no scim mapping for %s yet; creating/mapping instead of patching", adapter.getId());
+            try {
+                var created = this.create(aClass, kcModel);
+                return created == null || created.isSuccess() || adapter.getMapping() != null;
+            } catch (Exception ce) {
+                LOGGER.warnf("create fallback for %s failed: %s", adapter.getId(), ce.getMessage());
+                return false;
+            }
         } catch (IllegalStateException e) {
             // Raised by GroupAdapter when membership cannot be resolved completely. Refusing is the
             // correct behaviour there, but it is still a failed sync and must be reported as one.
@@ -557,6 +572,21 @@ public class ScimClient {
             SynchronizationResult syncRes) {
         LOGGER.debugf("Refreshing resources for %s", aClass.getSimpleName());
         getAdapter(aClass).getResourceStream().forEach(resource -> {
+            try {
+                refreshOne(aClass, resource, syncRes);
+            } catch (Exception e) {
+                // One unsyncable resource must not abort the run. Previously an exception here escaped
+                // through ScimDispatcher and ended the sync, so everything after the first bad group was
+                // silently never attempted.
+                LOGGER.errorf(e, "sync of one %s resource failed", aClass.getSimpleName());
+                syncRes.increaseFailed();
+            }
+        });
+    }
+
+    private <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void refreshOne(
+            Class<A> aClass, M resource, SynchronizationResult syncRes) {
+        {
             var adapter = getAdapter(aClass);
             adapter.apply(resource);
             String resourceInfo = getResourceInfo(adapter);
@@ -587,8 +617,7 @@ public class ScimClient {
             } else {
                 LOGGER.infof("Skipping refresh for %s", resourceInfo);
             }
-        });
-
+        }
     }
 
     public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void importResources(

@@ -134,6 +134,28 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         }
     }
 
+
+    /**
+     * Keycloak user -> remote user id.
+     *
+     * Order matters: the local SCIM mapping row first (authoritative when it exists), then a lookup by
+     * email. The email path is what makes membership work at all with propagation-user = "false",
+     * because in that mode the user adapter never runs and no mapping rows are ever written.
+     *
+     * Returns null when neither works. Callers must treat that as a refusal, never as "no member".
+     */
+    private String resolveRemoteUserId(UserModel user) {
+        try {
+            String mapped = query("findById", user.getId(), "User").getSingleResult().getExternalId();
+            if (mapped != null && !mapped.isBlank()) {
+                return mapped;
+            }
+        } catch (Exception ignored) {
+            // no mapping row - fall through to email
+        }
+        return user.getEmail() == null ? null : remoteUserIdByEmail.apply(user.getEmail());
+    }
+
     @Override
     public Group toSCIM(Boolean addMeta) {
         var group = new Group();
@@ -142,35 +164,41 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         group.setDisplayName(displayName);
         if (members.size() > 0) {
             var groupMembers = new ArrayList<Member>();
+            var unresolved = new ArrayList<String>();
             for (var member : members) {
-                var groupMember = new Member();
-                try {
-                    var user = session.users().getUserById(realm, member);
-                    if (user != null) {
-                        // Get the Databricks user ID from the mapping
-                        var userMapping = query("findById", user.getId(), "User");
-                        var mapping = userMapping.getSingleResult();
-                        String databricksUserId = mapping.getExternalId();
-                        groupMember.setValue(databricksUserId);
-                        var ref = new URI(String.format("Users/%s", databricksUserId));
-                        groupMember.setRef(ref.toString());
-                        groupMembers.add(groupMember);
-                    }
-                } catch (Exception e) {
-                    // Same hazard as toPatchBuilder: a skipped member here becomes an absent member in
-                    // the payload, which the server reads as a removal. Fail instead of under-reporting.
-                    throw new IllegalStateException(String.format(
-                            "Cannot serialise group '%s': member %s has no SCIM user mapping", displayName,
-                            member), e);
+                var user = session.users().getUserById(realm, member);
+                if (user == null) {
+                    unresolved.add(member + " (no such Keycloak user)");
+                    continue;
                 }
+                String remoteId = resolveRemoteUserId(user);
+                if (remoteId == null) {
+                    unresolved.add(String.format("%s <%s>", user.getUsername(), user.getEmail()));
+                    continue;
+                }
+                var groupMember = new Member();
+                groupMember.setValue(remoteId);
+                try {
+                    groupMember.setRef(new URI(String.format("Users/%s", remoteId)).toString());
+                } catch (URISyntaxException e) {
+                    // $ref is optional; the value is what identifies the member.
+                }
+                groupMembers.add(groupMember);
+            }
+            if (!unresolved.isEmpty()) {
+                // Still a refusal, not a silent drop - an absent member reads as a removal. But now it
+                // only fires when BOTH the mapping row and the email lookup came up empty.
+                throw new IllegalStateException(String.format(
+                        "Cannot serialise group '%s': %d of %d member(s) could not be resolved to a remote "
+                                + "user, by SCIM mapping or by email (%s).",
+                        displayName, unresolved.size(), members.size(), String.join("; ", unresolved)));
             }
             group.setMembers(groupMembers);
         }
         if (addMeta) {
             var meta = new Meta();
             try {
-                var uri = new URI("Groups/" + externalId);
-                meta.setLocation(uri.toString());
+                meta.setLocation(new URI("Groups/" + externalId).toString());
             } catch (URISyntaxException e) {
             }
             group.setMeta(meta);
@@ -270,17 +298,7 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 unresolved.add(member + " (no such Keycloak user)");
                 continue;
             }
-            String remoteId = null;
-            try {
-                remoteId = query("findById", user.getId(), "User").getSingleResult().getExternalId();
-            } catch (Exception ignored) {
-                // No mapping row. Fall back to matching on email, which is what username-source = "email"
-                // already declares the identity to be. This is a READ against the server; it does not
-                // create or modify the user, so it works with propagation-user = "false".
-                if (user.getEmail() != null) {
-                    remoteId = remoteUserIdByEmail.apply(user.getEmail());
-                }
-            }
+            String remoteId = resolveRemoteUserId(user);
             if (remoteId == null) {
                 unresolved.add(String.format("%s <%s>", user.getUsername(), user.getEmail()));
             } else {
