@@ -255,10 +255,34 @@ public class ScimClient {
             for (var g : remoteGroups) {
                 boolean match = (externalId != null && externalId.equals(g.getId().orElse(null)))
                         || groupAdapter.getDisplayName().equals(g.getDisplayName().orElse(null));
-                if (match) {
-                    groupAdapter.setRemoteMembers(g.getMembers());
-                    break;
+                if (!match) {
+                    continue;
                 }
+                // 🚨 Re-read the group on its own. Databricks does NOT populate `members` in the
+                // /Groups LIST response - only in GET /Groups/{id}. Trusting the list makes current
+                // membership look permanently empty, which has two consequences:
+                //   * removals compute as (currentUsers - desired) = {} and NEVER propagate, silently;
+                //   * "preserved" non-Keycloak members are never even seen, so the guard that protects
+                //     service principals is not actually exercised - it only appears to work because an
+                //     empty current set can produce nothing but additions.
+                // Verified on the account SCIM API 2026-08-24: list -> 0 members, get -> 2 members.
+                String id = g.getId().orElse(null);
+                if (id != null) {
+                    var oneResponse = scimRequestBuilder
+                            .get(de.captaingoldfish.scim.sdk.common.resources.Group.class,
+                                    "/" + adapter.getSCIMEndpoint() + "/" + id, null)
+                            .sendRequest();
+                    if (oneResponse.isSuccess() && oneResponse.getResource() != null) {
+                        groupAdapter.setRemoteMembers(oneResponse.getResource().getMembers());
+                    } else {
+                        LOGGER.warnf("GET of group %s returned %d; falling back to the list view "
+                                + "(additions only)", id, oneResponse.getHttpStatus());
+                        groupAdapter.setRemoteMembers(g.getMembers());
+                    }
+                } else {
+                    groupAdapter.setRemoteMembers(g.getMembers());
+                }
+                break;
             }
         } catch (Exception e) {
             // Without the current membership we cannot compute a safe delta. Leave remoteMembers empty:
