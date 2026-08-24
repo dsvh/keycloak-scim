@@ -291,6 +291,28 @@ public class ScimClient {
                     + "the patch will be additions only", groupAdapter.getDisplayName(), e.getMessage());
         }
 
+        groupAdapter.setEmailByRemoteUserId(remoteId -> {
+            if (remoteId == null || remoteId.isBlank()) {
+                return null;
+            }
+            try {
+                var users = fetchAllResources("/Users",
+                        de.captaingoldfish.scim.sdk.common.resources.User.class);
+                for (var u : users) {
+                    if (remoteId.equals(u.getId().orElse(null))) {
+                        var emails = u.getEmails();
+                        if (emails != null && !emails.isEmpty() && emails.get(0).getValue().isPresent()) {
+                            return emails.get(0).getValue().get();
+                        }
+                        return u.getUserName().orElse(null);
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.warnf("Remote user lookup by id failed for %s: %s", remoteId, e.getMessage());
+            }
+            return null;
+        });
+
         groupAdapter.setRemoteUserIdByEmail(email -> {
             if (email == null || email.isBlank()) {
                 return null;
@@ -316,6 +338,47 @@ public class ScimClient {
             }
             return null;
         });
+    }
+
+
+    /**
+     * Applies the SERVER -> KEYCLOAK half of the merge, then records the agreed member set as the new
+     * baseline on the Keycloak group.
+     *
+     * The baseline is what makes the next sync able to tell an addition here from a removal there; if
+     * it is not written, every sync degenerates back to "two states, no history" and the plugin starts
+     * guessing again.
+     */
+    private void applyLocalMembership(GroupAdapter adapter) {
+        var realm = session.getContext().getRealm();
+        var group = session.groups().getGroupById(realm, adapter.getId());
+        if (group == null) {
+            LOGGER.warnf("Group %s vanished locally during sync; not applying local membership", adapter.getId());
+            return;
+        }
+        for (String remoteId : adapter.getLocalAdditions()) {
+            String email = adapter.emailForRemoteId(remoteId);
+            var user = email == null ? null : session.users().getUserByEmail(realm, email);
+            if (user == null) {
+                LOGGER.warnf("Cannot add remote member %s (%s) to group %s locally: no Keycloak user "
+                        + "with that email", remoteId, email, group.getName());
+                continue;
+            }
+            user.joinGroup(group);
+            LOGGER.infof("Group %s: added %s locally (changed on the SCIM server)", group.getName(), email);
+        }
+        for (String remoteId : adapter.getLocalRemovals()) {
+            String email = adapter.emailForRemoteId(remoteId);
+            var user = email == null ? null : session.users().getUserByEmail(realm, email);
+            if (user == null) {
+                continue;
+            }
+            user.leaveGroup(group);
+            LOGGER.infof("Group %s: removed %s locally (removed on the SCIM server)", group.getName(), email);
+        }
+        var agreed = adapter.getAgreedMembers();
+        group.setSingleAttribute(GroupAdapter.BASELINE_ATTR, String.join(",", agreed));
+        LOGGER.infof("Group %s: baseline updated to %d member(s)", group.getName(), agreed.size());
     }
 
     private <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> boolean inScope(A adapter) {
@@ -437,7 +500,10 @@ public class ScimClient {
                     return false;
                 }
                 if (!g.hasMembershipChanges()) {
-                    LOGGER.infof("Group %s already matches Keycloak; nothing to patch", g.getDisplayName());
+                    // No remote change needed, but the server may still have changed something that has
+                    // to come back the other way - and the baseline must be recorded either way.
+                    applyLocalMembership(g);
+                    LOGGER.infof("Group %s: no remote change needed", g.getDisplayName());
                     return true;
                 }
             }
@@ -530,6 +596,12 @@ public class ScimClient {
                 LOGGER.warnf("replace of %s failed: HTTP %d %s", adapter.getId(), response.getHttpStatus(),
                         response.getResponseBody());
                 return false;
+            }
+            if (adapter instanceof GroupAdapter g2) {
+                // Only after the remote half succeeded - otherwise the baseline would claim agreement
+                // that does not exist, and the next sync would mistake the un-pushed change for a
+                // server-side removal.
+                applyLocalMembership(g2);
             }
             return true;
         } catch (NoResultException e) {

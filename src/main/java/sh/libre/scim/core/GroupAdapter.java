@@ -3,6 +3,7 @@ package sh.libre.scim.core;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -40,6 +41,59 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
     // propagation-user = "false" the user adapter never runs, so NO mapping rows exist and this is the
     // only way membership can be resolved at all.
     private java.util.function.Function<String, String> remoteUserIdByEmail = email -> null;
+
+    // remote user id -> email, so a membership change made on the SCIM server can be translated back
+    // to a Keycloak user.
+    private java.util.function.Function<String, String> emailByRemoteUserId = id -> null;
+
+    /**
+     * The member set as it was at the end of the last successful sync, stored on the Keycloak group as
+     * the attribute below.
+     *
+     * 🚨 This is the whole point of the three-way merge. Comparing only "Keycloak now" against
+     * "server now" cannot tell these apart:
+     *     Keycloak {A,B} / server {A}  =  B was just ADDED in Keycloak   -> push B
+     *     Keycloak {A,B} / server {A}  =  B was just REMOVED on the server -> drop B locally
+     * Identical states, opposite correct actions. The baseline is the third point of reference that
+     * makes them distinguishable.
+     *
+     * null means "no baseline yet" - first sync for this group - which is treated as a UNION so that
+     * nobody loses membership on the changeover.
+     */
+    public static final String BASELINE_ATTR = "scim-last-synced-members";
+    private Set<String> baseline = null;
+
+    // Outcome of the merge, for the caller to apply to Keycloak.
+    private final Set<String> localAdditions = new HashSet<>();
+    private final Set<String> localRemovals = new HashSet<>();
+    // The member set both sides should agree on once this sync completes - the next baseline.
+    private Set<String> agreedMembers = new HashSet<>();
+
+    public void setEmailByRemoteUserId(java.util.function.Function<String, String> f) {
+        if (f != null) {
+            this.emailByRemoteUserId = f;
+        }
+    }
+
+    public void setBaseline(Set<String> baseline) {
+        this.baseline = baseline;
+    }
+
+    public Set<String> getLocalAdditions() {
+        return localAdditions;
+    }
+
+    public Set<String> getLocalRemovals() {
+        return localRemovals;
+    }
+
+    public Set<String> getAgreedMembers() {
+        return agreedMembers;
+    }
+
+    public String emailForRemoteId(String remoteId) {
+        return emailByRemoteUserId.apply(remoteId);
+    }
 
     private final List<PatchOpSpec> pendingOps = new ArrayList<>();
 
@@ -93,6 +147,10 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 .map(x -> x.getId())
                 .collect(Collectors.toSet());
         this.skip = StringUtils.equals(group.getFirstAttribute("scim-skip"), "true");
+        String stored = group.getFirstAttribute(BASELINE_ATTR);
+        this.baseline = (stored == null || stored.isBlank())
+                ? null
+                : new HashSet<>(Arrays.asList(stored.split(",")));
     }
 
     @Override
@@ -334,10 +392,62 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                     displayName, preserved.size(), String.join(", ", preserved));
         }
 
-        List<Member> toAdd = desired.stream().filter(id -> !currentUsers.contains(id))
-                .map(id -> Member.builder().value(id).build()).collect(Collectors.toList());
-        List<String> toRemove = currentUsers.stream().filter(id -> !desired.contains(id))
-                .collect(Collectors.toList());
+        // ---- three-way merge: baseline (last synced) vs Keycloak (desired) vs server (currentUsers) ----
+        localAdditions.clear();
+        localRemovals.clear();
+        List<Member> toAdd;
+        List<String> toRemove;
+
+        if (baseline == null) {
+            // First sync for this group: no history, so no change can be attributed to either side.
+            // UNION - add what each side is missing, remove nothing. Nobody loses membership on the
+            // changeover, and the baseline written afterwards makes the next sync precise.
+            toAdd = desired.stream().filter(id -> !currentUsers.contains(id))
+                    .map(id -> Member.builder().value(id).build()).collect(Collectors.toList());
+            toRemove = new ArrayList<>();
+            currentUsers.stream().filter(id -> !desired.contains(id)).forEach(localAdditions::add);
+            agreedMembers = new HashSet<>(desired);
+            agreedMembers.addAll(currentUsers);
+            LOGGER.infof("Group %s: no baseline yet, treating as UNION (+%d remote, +%d local)",
+                    displayName, toAdd.size(), localAdditions.size());
+        } else {
+            // Attribute each difference to the side that actually changed.
+            Set<String> addedInKeycloak = desired.stream().filter(id -> !baseline.contains(id))
+                    .collect(Collectors.toSet());
+            Set<String> removedInKeycloak = baseline.stream().filter(id -> !desired.contains(id))
+                    .collect(Collectors.toSet());
+            Set<String> addedOnServer = currentUsers.stream().filter(id -> !baseline.contains(id))
+                    .collect(Collectors.toSet());
+            Set<String> removedOnServer = baseline.stream().filter(id -> !currentUsers.contains(id))
+                    .collect(Collectors.toSet());
+
+            // Push what Keycloak changed; pull what the server changed.
+            toAdd = addedInKeycloak.stream().filter(id -> !currentUsers.contains(id))
+                    .map(id -> Member.builder().value(id).build()).collect(Collectors.toList());
+            toRemove = removedInKeycloak.stream().filter(currentUsers::contains).collect(Collectors.toList());
+            addedOnServer.stream().filter(id -> !desired.contains(id)).forEach(localAdditions::add);
+            removedOnServer.stream().filter(desired::contains).forEach(localRemovals::add);
+
+            // Same member changed on both sides in opposite directions. Nothing in the data says which
+            // is newer, so pick the safe one - a removal wins over an addition. Losing access is
+            // recoverable in seconds; keeping access that someone tried to revoke is not.
+            Set<String> conflicted = new HashSet<>(addedInKeycloak);
+            conflicted.retainAll(removedOnServer);
+            if (!conflicted.isEmpty()) {
+                LOGGER.warnf("Group %s: %d member(s) added in Keycloak but removed on the server "
+                        + "(%s). Treating the REMOVAL as authoritative.",
+                        displayName, conflicted.size(), String.join(", ", conflicted));
+                toAdd.removeIf(m -> conflicted.contains(m.getValue().orElse("")));
+                localRemovals.addAll(conflicted);
+            }
+
+            agreedMembers = new HashSet<>(desired);
+            agreedMembers.addAll(localAdditions);
+            agreedMembers.removeAll(localRemovals);
+            LOGGER.infof("Group %s: merge vs baseline of %d - keycloak(+%d/-%d) server(+%d/-%d)",
+                    displayName, baseline.size(), addedInKeycloak.size(), removedInKeycloak.size(),
+                    addedOnServer.size(), removedOnServer.size());
+        }
 
         if (!toAdd.isEmpty()) {
             pendingOps.add(new PatchOpSpec(PatchOp.ADD, "members", toAdd));

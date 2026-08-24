@@ -73,14 +73,20 @@ smoke_one() {
 
   echo "##### Keycloak ${kc_version} #####"
 
-  echo "==> booting Keycloak with the plugin mounted"
-  docker run -d --name "$name" \
+  echo "==> booting Keycloak with the plugin mounted (port $port)"
+  if ! docker run -d --name "$name" \
     -p "127.0.0.1:${port}:8080" \
     -v "$jar:/opt/keycloak/providers/keycloak-scim.jar:ro" \
     -e KC_BOOTSTRAP_ADMIN_USERNAME="$admin_user" \
     -e KC_BOOTSTRAP_ADMIN_PASSWORD="$admin_pass" \
     -e KC_HEALTH_ENABLED=true \
-    "$image" start-dev >/dev/null
+    "$image" start-dev >/dev/null; then
+    # Distinguish "could not start" from "started and died". Reporting the wrong one sends you looking
+    # at the plugin when the actual cause is a busy port or a missing image.
+    echo "FAIL: could not start the container (see the docker error above) - this is an environment"
+    echo "      problem, not a plugin failure."
+    return 1
+  fi
 
   # 1. Keycloak becomes ready. Probing the OIDC discovery document rather than /health/ready keeps
   #    this to the one published port - health lives on the separate management port 9000.
@@ -166,12 +172,27 @@ PYEOF
   container=""
 }
 
-# One port per version so a leftover listener from a previous run cannot be mistaken for success.
-port=18080
+# Find a free port rather than assuming one. 18080 is a popular default and collides with, among
+# other things, a stray `kubectl port-forward` - which previously surfaced as a confusing
+# "container exited during startup".
+free_port() {
+  local p
+  for p in $(seq "${1:-18080}" "$(( ${1:-18080} + 200 ))"); do
+    if ! (exec 6<>/dev/tcp/127.0.0.1/"$p") 2>/dev/null; then
+      echo "$p"
+      return 0
+    fi
+    exec 6>&- 2>/dev/null || true
+  done
+  echo "${1:-18080}"
+}
+
+base_port=18080
 failed=()
 for v in $kc_versions; do
+  port="$(free_port "$base_port")"
   smoke_one "$v" "$port" || failed+=("$v")
-  port=$(( port + 1 ))
+  base_port=$(( port + 1 ))
   echo
 done
 
