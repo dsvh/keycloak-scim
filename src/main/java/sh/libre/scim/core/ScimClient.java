@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.NoResultException;
@@ -202,8 +203,9 @@ public class ScimClient {
                 adapter.apply(existingResource);
                 adapter.saveMapping();
                 LOGGER.infof("Mapped to existing resource for %s", adapter.getId());
-                this.replace(aClass, kcModel);
-                return true;
+                // The mapping row is saved either way - that part succeeded and is worth keeping - but
+                // report the outcome of the push honestly.
+                return this.replace(aClass, kcModel);
             } else {
                 LOGGER.infof("No existing resources found matching the criteria for %s", adapter.getId());
             }
@@ -213,11 +215,114 @@ public class ScimClient {
         return false;
     }
 
+
+    /**
+     * Is this group within the configured {@code group-filter}?
+     *
+     * 🚨 This guard exists because {@code group-filter} was only ever applied by
+     * {@code Adapter.getFilteredGroups()}, which feeds the PERIODIC SYNC. The event path
+     * ({@code ScimEventListenerProvider}) takes the changed group straight from the admin event and
+     * dispatches it, so ANY group membership change in the realm - not just in-scope ones - produced a
+     * write against the SCIM endpoint. On sso.daikinlab.com that meant every one of the realm's groups
+     * was reachable from a routine admin action, and while PATCH failed harmlessly on an id mismatch,
+     * CREATE would have succeeded and put arbitrary Keycloak groups into the Databricks account.
+     *
+     * Enforcing it here rather than in the listener means every caller is covered - event, sync and
+     * anything added later - and it is evaluated per component, which is correct when more than one
+     * provider is configured.
+     *
+     * Users are not filtered: {@code group-filter} has never constrained them (which is how a test user
+     * leaked during the ss-infra rehearsal). {@code propagation-user} is the control for those.
+     */
+
+    /**
+     * Gives a GroupAdapter what it needs to compute a membership DELTA instead of a blind replace:
+     * the group's current server-side members, and a way to resolve a Keycloak user to a remote id by
+     * email when no local SCIM mapping row exists.
+     *
+     * Both are READS. Nothing here creates or modifies a user, so it is safe with
+     * propagation-user = "false" - which is the configuration that made membership unresolvable before,
+     * because the user adapter never runs and therefore no mapping rows are ever written.
+     */
+    private <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void primeGroupDelta(A adapter) {
+        if (!(adapter instanceof GroupAdapter groupAdapter)) {
+            return;
+        }
+        String externalId = adapter.getExternalId();
+        try {
+            var remoteGroups = fetchAllResources(adapter.getSCIMEndpoint(),
+                    de.captaingoldfish.scim.sdk.common.resources.Group.class);
+            for (var g : remoteGroups) {
+                boolean match = (externalId != null && externalId.equals(g.getId().orElse(null)))
+                        || groupAdapter.getDisplayName().equals(g.getDisplayName().orElse(null));
+                if (match) {
+                    groupAdapter.setRemoteMembers(g.getMembers());
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            // Without the current membership we cannot compute a safe delta. Leave remoteMembers empty:
+            // the delta then contains only additions, which can never remove anyone.
+            LOGGER.warnf("Could not read current membership of group %s (%s); "
+                    + "the patch will be additions only", groupAdapter.getDisplayName(), e.getMessage());
+        }
+
+        groupAdapter.setRemoteUserIdByEmail(email -> {
+            if (email == null || email.isBlank()) {
+                return null;
+            }
+            try {
+                var users = fetchAllResources("/Users",
+                        de.captaingoldfish.scim.sdk.common.resources.User.class);
+                for (var u : users) {
+                    var emails = u.getEmails();
+                    if (emails != null) {
+                        for (var e : emails) {
+                            if (e.getValue().isPresent() && email.equalsIgnoreCase(e.getValue().get())) {
+                                return u.getId().orElse(null);
+                            }
+                        }
+                    }
+                    if (email.equalsIgnoreCase(u.getUserName().orElse(""))) {
+                        return u.getId().orElse(null);
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.warnf("Remote user lookup by email failed for %s: %s", email, e.getMessage());
+            }
+            return null;
+        });
+    }
+
+    private <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> boolean inScope(A adapter) {
+        if (!(adapter instanceof GroupAdapter groupAdapter)) {
+            return true;
+        }
+        String filter = this.model.get("group-filter");
+        if (filter == null || filter.trim().isEmpty()) {
+            return true;
+        }
+        String name = groupAdapter.getDisplayName();
+        if (name == null) {
+            return true;
+        }
+        for (String p : filter.split(",")) {
+            if (Pattern.compile(p.trim()).matcher(name).matches()) {
+                return true;
+            }
+        }
+        LOGGER.infof("Skipping group '%s': outside group-filter '%s'", name, filter);
+        return false;
+    }
+
     public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> ServerResponse<S> create(Class<A> aClass,
             M kcModel) {
         var adapter = getAdapter(aClass);
         adapter.apply(kcModel);
         if (adapter.skip) {
+            return null;
+        }
+        if (!inScope(adapter)) {
             return null;
         }
         // If mapping exist then it was created by import so skip.
@@ -272,13 +377,41 @@ public class ScimClient {
         return response;
     };
 
-    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void replace(Class<A> aClass,
+    /**
+     * Pushes one local resource to the server.
+     *
+     * @return true only if the server accepted the change. Previously this returned void and swallowed
+     *         every failure into a log line, so callers had no way to tell success from failure -
+     *         which is how a sync where every single operation failed still reported
+     *         "finished successfully, 2 users updated" on 2026-08-21. Callers MUST branch on this.
+     */
+    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> boolean replace(Class<A> aClass,
             M kcModel) {
         var adapter = getAdapter(aClass);
         try {
             adapter.apply(kcModel);
             if (adapter.skip) {
-                return;
+                // Deliberately not synced (scim-skip attribute) - not a failure.
+                return true;
+            }
+            if (!inScope(adapter)) {
+                return true;
+            }
+            primeGroupDelta(adapter);
+            if (adapter instanceof GroupAdapter g) {
+                // Build the operations now so we can tell whether anything actually changed. A PATCH with
+                // no operations is not a valid SCIM request, and sending one turns a no-op sync into an
+                // error.
+                try {
+                    g.toPatchBuilder(scimRequestBuilder, "/" + adapter.getSCIMEndpoint() + "/" + adapter.getExternalId());
+                } catch (IllegalStateException e) {
+                    LOGGER.warnf("refusing to sync group %s: %s", g.getDisplayName(), e.getMessage());
+                    return false;
+                }
+                if (!g.hasMembershipChanges()) {
+                    LOGGER.infof("Group %s already matches Keycloak; nothing to patch", g.getDisplayName());
+                    return true;
+                }
             }
             var resource = adapter.query("findById", adapter.getId()).getSingleResult();
             adapter.apply(resource);
@@ -365,14 +498,23 @@ public class ScimClient {
                 }
             }
             
-            if (!response.isSuccess()){
-                LOGGER.warn(response.getResponseBody());
-                LOGGER.debug(response.getHttpStatus());
+            if (!response.isSuccess()) {
+                LOGGER.warnf("replace of %s failed: HTTP %d %s", adapter.getId(), response.getHttpStatus(),
+                        response.getResponseBody());
+                return false;
             }
+            return true;
         } catch (NoResultException e) {
             LOGGER.warnf("failed to replace resource %s, scim mapping not found", adapter.getId());
+            return false;
+        } catch (IllegalStateException e) {
+            // Raised by GroupAdapter when membership cannot be resolved completely. Refusing is the
+            // correct behaviour there, but it is still a failed sync and must be reported as one.
+            LOGGER.warnf("refused to replace resource %s: %s", adapter.getId(), e.getMessage());
+            return false;
         } catch (Exception e) {
-            LOGGER.error(e);
+            LOGGER.errorf(e, "replace of %s threw", adapter.getId());
+            return false;
         }
     }
 
@@ -434,8 +576,13 @@ public class ScimClient {
                     }
                 } else {
                     LOGGER.infof("Updating remote resource for %s", resourceInfo);
-                    this.replace(aClass, resource);
-                    trackUpdated(syncRes, adapter, resourceInfo);
+                    if (this.replace(aClass, resource)) {
+                        trackUpdated(syncRes, adapter, resourceInfo);
+                    } else {
+                        // Was unconditionally trackUpdated, which is what made a wholly failed sync
+                        // report success.
+                        trackFailed(syncRes, adapter, resourceInfo + " (update failed)");
+                    }
                 }
             } else {
                 LOGGER.infof("Skipping refresh for %s", resourceInfo);
