@@ -170,7 +170,7 @@ what it ships, update those too.
 To check a single version ad hoc, pass it explicitly:
 
 ```sh
-./.github/scripts/check-classpath-overlap.sh build/libs/keycloak-scim-1.5-all.jar 26.6.4
+./.github/scripts/check-classpath-overlap.sh build/libs/keycloak-scim-1.6.0-all.jar 26.6.4
 ```
 
 
