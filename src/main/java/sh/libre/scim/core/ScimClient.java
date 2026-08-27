@@ -2,8 +2,10 @@ package sh.libre.scim.core;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import jakarta.persistence.EntityManager;
@@ -356,12 +358,17 @@ public class ScimClient {
             LOGGER.warnf("Group %s vanished locally during sync; not applying local membership", adapter.getId());
             return;
         }
+        // Remote members we could NOT add to the Keycloak group. These must be kept OUT of the
+        // baseline - see the comment where the baseline is written below.
+        Set<String> unapplied = new HashSet<>();
         for (String remoteId : adapter.getLocalAdditions()) {
             String email = adapter.emailForRemoteId(remoteId);
             var user = email == null ? null : session.users().getUserByEmail(realm, email);
             if (user == null) {
                 LOGGER.warnf("Cannot add remote member %s (%s) to group %s locally: no Keycloak user "
-                        + "with that email", remoteId, email, group.getName());
+                        + "with that email. Excluding it from the baseline so the next sync retries "
+                        + "instead of deleting it on the server.", remoteId, email, group.getName());
+                unapplied.add(remoteId);
                 continue;
             }
             user.joinGroup(group);
@@ -376,7 +383,24 @@ public class ScimClient {
             user.leaveGroup(group);
             LOGGER.infof("Group %s: removed %s locally (removed on the SCIM server)", group.getName(), email);
         }
-        var agreed = adapter.getAgreedMembers();
+        // 🚨 The baseline must describe what is ACTUALLY true in Keycloak, not what we intended.
+        //
+        // A member that exists on the server but resolves to no Keycloak user is skipped above. If it
+        // were still written into the baseline, the NEXT sync would compute
+        // `removedInKeycloak = baseline - desired` and find it there, while `currentUsers` still holds
+        // it on the server - producing a PATCH that REMOVES it remotely. A lookup failure would
+        // silently become a deletion, one sync later.
+        //
+        // Excluding it instead makes the next sync see it as `addedOnServer` again and retry the local
+        // add. The failure stays a failure until someone creates the Keycloak user; it never escalates
+        // into data loss.
+        var agreed = new HashSet<>(adapter.getAgreedMembers());
+        if (!unapplied.isEmpty()) {
+            agreed.removeAll(unapplied);
+            LOGGER.warnf("Group %s: %d remote member(s) could not be applied locally and were excluded "
+                    + "from the baseline; they will be retried on the next sync.",
+                    group.getName(), unapplied.size());
+        }
         group.setSingleAttribute(GroupAdapter.BASELINE_ATTR, String.join(",", agreed));
         LOGGER.infof("Group %s: baseline updated to %d member(s)", group.getName(), agreed.size());
     }
